@@ -211,12 +211,16 @@ static gemm_path_i8 resolve_gemm_i8() {
     if (global_spine_env_info.use_ime1) {
         using spacemit_kernels::a_pack;
         const auto i1_r1 = spacemit_kernels::ime1::quantize_a_i8_r1;
+        const auto i1_r4 = spacemit_kernels::ime1::quantize_a_i8_r4;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                       std::is_same_v<BLOC_TYPE, block_q4_K>) {
-            const size_t i1_row = spacemit_kernels::q8_blk_size(blk_len);
             // Same kernel serves MoE experts and dense 2-D weights; the official table only
             // wired up the MoE path, leaving dense GEMM on IME1 (K1) without IME acceleration.
-            return { spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, nullptr, a_pack::r1, i1_row, i1_row };
+            // NOTE: the M4 kernel asserts a_pack::r4, so dense must pack A in 4-row groups.
+            // ime1::quantize_a_i8_r4 writes 36 B/row (fp32 scale + 32 int8, no blk sum),
+            // so both row strides are q8_blk_size(blk_len).
+            const size_t i1_row = spacemit_kernels::q8_blk_size(blk_len);
+            return { spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, i1_r4, a_pack::r4, i1_row, i1_row };
         }
     }
 #endif
