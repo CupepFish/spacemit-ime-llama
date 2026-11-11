@@ -270,6 +270,157 @@ static gemm_path_f16 resolve_gemm_f16() {
     return o;
 }
 
+// ============================================================================
+// SMEPilot-style mixed IME+RVV execution (mechanism 1: tile-level partitioning)
+// ============================================================================
+// Env knobs (read once, process-lifetime):
+//   GGML_SPACEMIT_MIX        =1  enable mixed IME+RVV GEMM (default 0, off)
+//   GGML_SPACEMIT_MIX_IME    int, number of threads assigned to IME kernel
+//                            (default nth/2, clamped to [1, nth-1])
+//   GGML_SPACEMIT_MIX_MIN_M  int, minimum gemm_m to enable mixing (default 64)
+//
+// Design: split the M dimension of a prefill GEMM at m_split (4-row aligned).
+// Threads [0, n_ime)   -> IME kernel over rows [0, m_split)
+// Threads [n_ime, nth) -> RVV fp32 kernel over rows [m_split, gemm_m)
+// The RVV side reads the *original* fp32 activation (src1) and dequantizes the
+// repacked Q4_0 weights on the fly, so it is fully independent of the IME-side
+// quantized-A buffer.
+
+#include <riscv_vector.h>
+
+struct mix_exec_config {
+    bool    enabled     = false;
+    int     ime_workers = 0;    // threads assigned to IME; rest go to RVV
+    int64_t min_m       = 64;
+};
+
+static const mix_exec_config & mix_config() {
+    static mix_exec_config cfg = [] {
+        mix_exec_config c;
+        const char * e = getenv("GGML_SPACEMIT_MIX");
+        c.enabled      = e && strcmp(e, "1") == 0;
+        if (const char * w = getenv("GGML_SPACEMIT_MIX_IME")) {
+            c.ime_workers = atoi(w);
+        }
+        if (const char * m = getenv("GGML_SPACEMIT_MIX_MIN_M")) {
+            c.min_m = atoll(m);
+        }
+        if (c.enabled) {
+            fprintf(stderr, "[spacemit-mix] enabled, ime_workers=%d (0=auto nth/2), min_m=%lld\n",
+                    c.ime_workers, (long long) c.min_m);
+        }
+        return c;
+    }();
+    return cfg;
+}
+
+static int mix_ime_workers(int nth) {
+    int n_ime = mix_config().ime_workers > 0 ? mix_config().ime_workers : nth / 2;
+    if (n_ime < 1)      n_ime = 1;
+    if (n_ime > nth - 1) n_ime = nth - 1;   // keep >=1 RVV worker
+    return n_ime;
+}
+
+// scalar fp16 -> fp32 (only used for per-block scales, perf irrelevant)
+static inline float mix_fp16_to_fp32(uint16_t h) {
+    uint32_t sign = (uint32_t) (h >> 15) << 31;
+    uint32_t exp  = (h >> 10) & 0x1F;
+    uint32_t man  = h & 0x3FF;
+    uint32_t bits;
+    if (exp == 0) {
+        if (man == 0) {
+            bits = sign;
+        } else {  // subnormal
+            exp = 1;
+            while ((man & 0x400) == 0) { man <<= 1; exp--; }
+            man &= 0x3FF;
+            bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+        }
+    } else if (exp == 31) {
+        bits = sign | 0x7F800000u | (man << 13);
+    } else {
+        bits = sign | ((exp + 127 - 15) << 23) | (man << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+// Repacked Q4_0 block layout for K1 (block_q4_0x16, 288 bytes):
+//   offset 0  : ggml_half d[16]         -- one fp16 scale per output row
+//   offset 32 : uint8_t  qs[256]        -- 16 rows x 32 nibbles
+//     row r, k in [0, 7]  : low  nibble of qs[r*8 + k]
+//     row r, k in [8,15]  : high nibble of qs[r*8 + k - 8]
+//     row r, k in [16,23] : low  nibble of qs[128 + r*8 + (k-16)]
+//     row r, k in [24,31] : high nibble of qs[128 + r*8 + (k-24)]
+//   value = (q - 8) * d[r]
+static constexpr int64_t MIX_Q4_BLK_BYTES = 288;
+static constexpr int64_t MIX_Q4_BLK_QS    = 32;   // offset of qs inside block
+
+static inline float mix_q4_0x16_at(const uint8_t * blk, int r, int k) {
+    const uint8_t * qs   = blk + MIX_Q4_BLK_QS;
+    int             half = k >> 4;           // 0: k<16, 1: k>=16
+    int             kk   = k & 15;
+    uint8_t         b    = qs[half * 128 + r * 8 + (kk & 7)];
+    int             q    = (kk < 8) ? (b & 0x0F) : (b >> 4);
+    float           d    = mix_fp16_to_fp32(((const uint16_t *) blk)[r]);
+    return (q - 8) * d;
+}
+
+// Dequantize one 16-row strip (rows [n0, n0+rows) x all K) into fp32.
+// strip layout: row-major, row r at strip + r * gemm_k.
+static void mix_dequant_strip_q4_0x16(const uint8_t * w_data, int64_t row_stride_b, int64_t nb, int rows,
+                                      int64_t gemm_k, float * strip) {
+    const int64_t b_k_blks = row_stride_b / MIX_Q4_BLK_BYTES;
+    for (int r = 0; r < rows; r++) {
+        float * dst = strip + (int64_t) r * gemm_k;
+        for (int64_t kb = 0; kb < b_k_blks; kb++) {
+            const uint8_t * blk = w_data + nb * row_stride_b + kb * MIX_Q4_BLK_BYTES;
+            for (int k = 0; k < 32; k++) {
+                dst[kb * 32 + k] = mix_q4_0x16_at(blk, r, k);
+            }
+        }
+    }
+}
+
+// RVV fp32 GEMM over rows [m_begin, m_end) x all gemm_n columns.
+// A = feature (row-major fp32, lda = gemm_k); C = output + m*gemm_n.
+static void mix_rvv_gemm_rows_q4_0x16(const float * feature, int64_t gemm_k, const uint8_t * w_data,
+                                      int64_t row_stride_b, float * output, int64_t gemm_n, int64_t m_begin,
+                                      int64_t m_end) {
+    // per-thread dequant strip buffer (16 x gemm_k floats), heap-allocated once
+    static thread_local std::vector<float> strip_buf;
+    if ((int64_t) strip_buf.size() < 16 * gemm_k) {
+        strip_buf.resize(16 * gemm_k);
+    }
+    float * strip = strip_buf.data();
+
+    for (int64_t nb = 0; nb * 16 < gemm_n; nb++) {
+        const int rows = (int) std::min<int64_t>(16, gemm_n - nb * 16);
+        mix_dequant_strip_q4_0x16(w_data, row_stride_b, nb, rows, gemm_k, strip);
+
+        for (int64_t m = m_begin; m < m_end; m++) {
+            const float * a = feature + m * gemm_k;
+            float *       c = output + m * gemm_n + nb * 16;
+            for (int r = 0; r < rows; r++) {
+                const float * b = strip + (int64_t) r * gemm_k;
+                // RVV fp32 dot product over gemm_k
+                vfloat32m1_t vsum = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+                int64_t      k    = 0;
+                while (k < gemm_k) {
+                    size_t        vl  = __riscv_vsetvl_e32m4(gemm_k - k);
+                    vfloat32m4_t va   = __riscv_vle32_v_f32m4(a + k, vl);
+                    vfloat32m4_t vb   = __riscv_vle32_v_f32m4(b + k, vl);
+                    vfloat32m4_t prod = __riscv_vfmul_vv_f32m4(va, vb, vl);
+                    vsum              = __riscv_vfredusum_vs_f32m4_f32m1(prod, vsum, vl);
+                    k += vl;
+                }
+                c[r] = __riscv_vfmv_f_s_f32m1_f32(vsum);
+            }
+        }
+    }
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
     const gemm_path_i8 dense_ops_;
     const gemm_path_i8 moe_ops_;
@@ -543,7 +694,29 @@ private:
         }
 
         if (gemm_n_stride == gemm_n && tcm_buffer != nullptr && per_mb_rows_wsize <= tcm_buffer_size) {
-            for (int64_t m_start = ith * row_align; m_start < gemm_m; m_start += row_align * nth) {
+            // SMEPilot-style mixed IME+RVV execution (K1 Q4_0 path only).
+            // IME threads compute rows [0, m_split); RVV threads compute rows [m_split, gemm_m).
+            constexpr bool kMixSupported = std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 32 &&
+                                           NB_COLS == 16;
+            const bool     mix_active    = kMixSupported && mix_config().enabled && gemm_m >= mix_config().min_m;
+            const int      n_ime         = mix_active ? mix_ime_workers(nth) : nth;
+            const int64_t  m_split       = mix_active ? ((gemm_m * n_ime / nth + row_align - 1) / row_align) * row_align
+                                                      : gemm_m;
+
+            if (mix_active && ith >= n_ime) {
+                const int     n_rvv = nth - n_ime;
+                const int64_t m_rows = gemm_m - m_split;
+                const int64_t per    = spacemit_kernels::div_round_up(m_rows, n_rvv);
+                const int64_t mb     = m_split + (int64_t) (ith - n_ime) * per;
+                const int64_t me     = std::min(mb + per, gemm_m);
+                if (mb < me) {
+                    mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
+                                              output, gemm_n, mb, me);
+                }
+                return;
+            }
+
+            for (int64_t m_start = ith * row_align; m_start < m_split; m_start += row_align * n_ime) {
                 uint8_t * b_col    = reinterpret_cast<uint8_t *>(w_data);
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
