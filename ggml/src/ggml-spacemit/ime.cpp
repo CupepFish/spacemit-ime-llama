@@ -1444,6 +1444,14 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 }
                 if (op->src[1]->type == GGML_TYPE_F32 &&
                     ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
+                    if (getenv("GGML_SPACEMIT_MM_TRACE") != nullptr) {
+                        static bool logged_fallback = false;
+                        if (!logged_fallback) {
+                            logged_fallback = true;
+                            fprintf(stderr, "[mm-fallback] MUL_MAT on scalar/vec_dot path (src0 type=%s)\n",
+                                    ggml_type_name(op->src[0]->type));
+                        }
+                    }
                     spacemit_kernels::scalar::forward_mul_mat(ctx, op);
                     return true;
                 }
@@ -2606,7 +2614,28 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
                 // Dense 2-D Q4_0 weights on IME1 (K1): allow ne[2]==1 so dense GEMM also
                 // takes the IME path instead of the generic scalar fallback.
                 if (cur->ne[1] % 16 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1)) {
+                    if (getenv("GGML_SPACEMIT_MM_TRACE") != nullptr) {
+                        static bool logged = false;
+                        if (!logged) {
+                            logged = true;
+                            fprintf(stderr,
+                                    "[repack] Q4_0 dense -> i8_traits<32,16> IME1 (first tensor: %s, ne=[%lld,%lld,%lld])\n",
+                                    cur->name, (long long) cur->ne[0], (long long) cur->ne[1],
+                                    (long long) cur->ne[2]);
+                        }
+                    }
                     return &i8_traits<block_q4_0, 32, 16>();
+                }
+                if (getenv("GGML_SPACEMIT_MM_TRACE") != nullptr) {
+                    static bool logged_reject = false;
+                    if (!logged_reject) {
+                        logged_reject = true;
+                        fprintf(stderr,
+                                "[repack] Q4_0 dense REJECTED (first tensor: %s, ne=[%lld,%lld,%lld], use_ime1=%d)\n",
+                                cur->name, (long long) cur->ne[0], (long long) cur->ne[1],
+                                (long long) cur->ne[2],
+                                (int) ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1);
+                    }
                 }
 #endif
             }
