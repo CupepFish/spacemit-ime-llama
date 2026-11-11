@@ -213,10 +213,10 @@ static gemm_path_i8 resolve_gemm_i8() {
         const auto i1_r1 = spacemit_kernels::ime1::quantize_a_i8_r1;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                       std::is_same_v<BLOC_TYPE, block_q4_K>) {
-            if constexpr (MOE) {
-                const size_t i1_row = spacemit_kernels::q8_blk_size(blk_len);
-                return { spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, nullptr, a_pack::r1, i1_row, i1_row };
-            }
+            const size_t i1_row = spacemit_kernels::q8_blk_size(blk_len);
+            // Same kernel serves MoE experts and dense 2-D weights; the official table only
+            // wired up the MoE path, leaving dense GEMM on IME1 (K1) without IME acceleration.
+            return { spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, nullptr, a_pack::r1, i1_row, i1_row };
         }
     }
 #endif
@@ -600,6 +600,11 @@ private:
         const int64_t gemm_m = ne11 * ne12 * ne13;
         const int64_t gemm_k = ne10;
         const int64_t gemm_n = ne01;
+
+        if (ith == 0 && getenv("GGML_SPACEMIT_MM_TRACE") != nullptr) {
+            fprintf(stderr, "[ime-mm] dense MUL_MAT M=%lld K=%lld N=%lld type=%s\n", (long long) gemm_m,
+                    (long long) gemm_k, (long long) gemm_n, ggml_type_name(src0->type));
+        }
 
         const gemm_path_i8 & path = dense_ops_;
         if (!path.kernel) {
@@ -2598,7 +2603,9 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
 #endif
 
 #if defined(RISCV64_SPACEMIT_IME1)
-                if (cur->ne[2] > 1 && cur->ne[1] % 16 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1)) {
+                // Dense 2-D Q4_0 weights on IME1 (K1): allow ne[2]==1 so dense GEMM also
+                // takes the IME path instead of the generic scalar fallback.
+                if (cur->ne[1] % 16 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1)) {
                     return &i8_traits<block_q4_0, 32, 16>();
                 }
 #endif
