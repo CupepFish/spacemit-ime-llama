@@ -739,6 +739,26 @@ private:
                 if (mb < me) {
                     ggml::cpu::riscv64_spacemit::mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
                                               output, gemm_n, mb, me);
+                    if (getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
+                        // 自检: 标量重算 mb 行 nb=0 块的前 4 列, 与 RVV 结果对比
+                        const uint8_t * blk0 = reinterpret_cast<const uint8_t *>(w_data);
+                        for (int c = 0; c < 4; c++) {
+                            double ref = 0;
+                            for (int64_t kb = 0; kb * MIX_Q4_BLK_BYTES < row_stride_b; kb++) {
+                                const uint8_t * blk = blk0 + kb * MIX_Q4_BLK_BYTES;
+                                float d = ggml::cpu::riscv64_spacemit::mix_fp16_to_fp32(((const uint16_t *) blk)[c]);
+                                for (int k = 0; k < 32; k++) {
+                                    int half = k >> 4, jj = k & 15;
+                                    uint8_t byte = blk[MIX_Q4_BLK_QS + half * 128 + c * 8 + (jj & 7)];
+                                    int q = (jj < 8) ? (byte & 0x0F) : (byte >> 4);
+                                    ref += feature[mb * gemm_k + kb * 32 + k] * (q - 8) * d;
+                                }
+                            }
+                            double got = output[mb * gemm_n + c];
+                            fprintf(stderr, "[mix-dbg] row=%lld col=%d ref=%.4f got=%.4f %s\n", (long long) mb, c,
+                                    ref, got, fabs(ref - got) < 0.05 * fabs(ref) + 1e-3 ? "OK" : "MISMATCH");
+                        }
+                    }
                 }
                 // 不能 return: 所有线程必须到达函数末尾的 ctx.sync(),
                 // 提前退出会导致 barrier 计数不匹配, 破坏后续所有算子
