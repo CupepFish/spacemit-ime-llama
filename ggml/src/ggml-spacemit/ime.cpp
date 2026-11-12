@@ -754,23 +754,41 @@ private:
                     ggml::cpu::riscv64_spacemit::mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
                                               output, gemm_n, mb, me);
                     if (getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
-                        // 自检: 标量重算 mb 行 nb=0 块的前 4 列, 与 RVV 结果对比
-                        const uint8_t * blk0 = reinterpret_cast<const uint8_t *>(w_data);
-                        for (int c = 0; c < 4; c++) {
-                            double ref = 0;
-                            for (int64_t kb = 0; kb * MIX_Q4_BLK_BYTES < row_stride_b; kb++) {
-                                const uint8_t * blk = blk0 + kb * MIX_Q4_BLK_BYTES;
-                                float d = ggml::cpu::riscv64_spacemit::mix_fp16_to_fp32(((const uint16_t *) blk)[c]);
-                                for (int k = 0; k < 32; k++) {
-                                    int half = k >> 4, jj = k & 15;
-                                    uint8_t byte = blk[MIX_Q4_BLK_QS + half * 128 + c * 8 + (jj & 7)];
-                                    int q = (jj < 8) ? (byte & 0x0F) : (byte >> 4);
-                                    ref += feature[mb * gemm_k + kb * 32 + k] * (q - 8) * d;
+                        // 全量自检: 该线程 RVV 范围内随机抽样 (行×列), 标量参考对比
+                        // 报告 max abs err / 位置 / NaN 统计
+                        static thread_local bool dumped = false;
+                        if (!dumped) {
+                            dumped = true;
+                            const uint8_t * wbase = reinterpret_cast<const uint8_t *>(w_data);
+                            double max_err = 0; int64_t bad_m = -1, bad_n = -1;
+                            int nan_cnt = 0, checked = 0;
+                            for (int64_t m = mb; m < me; m += 13) {
+                                for (int64_t n = 0; n < gemm_n; n += 17) {
+                                    double ref = 0;
+                                    const uint8_t * nbbase = wbase + (n / 16) * row_stride_b;
+                                    int rr = (int) (n % 16);
+                                    for (int64_t kb = 0; kb * MIX_Q4_BLK_BYTES < row_stride_b; kb++) {
+                                        const uint8_t * blk = nbbase + kb * MIX_Q4_BLK_BYTES;
+                                        float d = ggml::cpu::riscv64_spacemit::mix_fp16_to_fp32(((const uint16_t *) blk)[rr]);
+                                        for (int k = 0; k < 32; k++) {
+                                            int half = k >> 4, jj = k & 15;
+                                            uint8_t byte = blk[MIX_Q4_BLK_QS + half * 128 + rr * 8 + (jj & 7)];
+                                            int q = (jj < 8) ? (byte & 0x0F) : (byte >> 4);
+                                            ref += feature[m * gemm_k + kb * 32 + k] * (q - 8) * d;
+                                        }
+                                    }
+                                    double got = output[m * gemm_n + n];
+                                    if (std::isnan(got) || std::isnan((float) ref)) { nan_cnt++; continue; }
+                                    double err = fabs(ref - got);
+                                    if (err > max_err) { max_err = err; bad_m = m; bad_n = n; }
+                                    checked++;
                                 }
                             }
-                            double got = output[mb * gemm_n + c];
-                            fprintf(stderr, "[mix-dbg] row=%lld col=%d ref=%.4f got=%.4f %s\n", (long long) mb, c,
-                                    ref, got, fabs(ref - got) < 0.05 * fabs(ref) + 1e-3 ? "OK" : "MISMATCH");
+                            fprintf(stderr,
+                                    "[mix-dbg] ith=%d M=%lld N=%lld K=%lld range=[%lld,%lld) max_err=%.4f @(%lld,%lld) nan=%d checked=%d\n",
+                                    ith, (long long) gemm_m, (long long) gemm_n, (long long) gemm_k,
+                                    (long long) mb, (long long) me, max_err, (long long) bad_m, (long long) bad_n,
+                                    nan_cnt, checked);
                         }
                     }
                 }
