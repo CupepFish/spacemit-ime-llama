@@ -441,7 +441,7 @@ static void mix_rvv_gemm_rows_q4_0x16(const float * feature, int64_t gemm_k, con
             __riscv_vse32_v_f32m1(c + vl, acc1, vl);
         }
     }
-}}
+}
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
     const gemm_path_i8 dense_ops_;
