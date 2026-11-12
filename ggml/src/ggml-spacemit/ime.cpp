@@ -725,8 +725,8 @@ private:
             // IME threads compute rows [0, m_split); RVV threads compute rows [m_split, gemm_m).
             constexpr bool kMixSupported = std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 32 &&
                                            NB_COLS == 16;
-            const bool     mix_active    = kMixSupported && mix_config().enabled && gemm_m >= mix_config().min_m;
-            const int      n_ime         = mix_active ? mix_ime_workers(nth) : nth;
+            const bool     mix_active    = kMixSupported && ggml::cpu::riscv64_spacemit::mix_config().enabled && gemm_m >= ggml::cpu::riscv64_spacemit::mix_config().min_m;
+            const int      n_ime         = mix_active ? ggml::cpu::riscv64_spacemit::mix_ime_workers(nth) : nth;
             const int64_t  m_split       = mix_active ? ((gemm_m * n_ime / nth + row_align - 1) / row_align) * row_align
                                                       : gemm_m;
 
@@ -737,7 +737,7 @@ private:
                 const int64_t mb     = m_split + (int64_t) (ith - n_ime) * per;
                 const int64_t me     = std::min(mb + per, gemm_m);
                 if (mb < me) {
-                    mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
+                    ggml::cpu::riscv64_spacemit::mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
                                               output, gemm_n, mb, me);
                 }
                 return;
