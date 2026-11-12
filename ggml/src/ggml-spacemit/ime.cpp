@@ -730,6 +730,10 @@ private:
             const int64_t  m_split       = mix_active ? ((gemm_m * n_ime / nth + row_align - 1) / row_align) * row_align
                                                       : gemm_m;
 
+            if (getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
+                fprintf(stderr, "[mix-dbg2] ith=%d nth=%d mix_active=%d n_ime=%d m_split=%lld gemm_m=%lld N=%lld\n",
+                        ith, nth, (int) mix_active, n_ime, (long long) m_split, (long long) gemm_m, (long long) gemm_n);
+            }
             if (mix_active && ith >= n_ime) {
                 const int     n_rvv = nth - n_ime;
                 const int64_t m_rows = gemm_m - m_split;
