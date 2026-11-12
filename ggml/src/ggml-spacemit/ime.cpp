@@ -756,9 +756,8 @@ private:
                     if (getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
                         // 全量自检: 该线程 RVV 范围内随机抽样 (行×列), 标量参考对比
                         // 报告 max abs err / 位置 / NaN 统计
-                        static thread_local bool dumped = false;
-                        if (!dumped) {
-                            dumped = true;
+                        // 只全扫大 K 算子 (down proj), 小 K 的已验证正确
+                        if (gemm_k >= 4096) {
                             const uint8_t * wbase = reinterpret_cast<const uint8_t *>(w_data);
                             double max_err = 0; int64_t bad_m = -1, bad_n = -1;
                             int nan_cnt = 0, checked = 0;
