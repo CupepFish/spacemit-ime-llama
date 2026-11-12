@@ -627,6 +627,10 @@ private:
             fprintf(stderr, "[ime-mm] dense MUL_MAT M=%lld K=%lld N=%lld type=%s\n", (long long) gemm_m,
                     (long long) gemm_k, (long long) gemm_n, ggml_type_name(src0->type));
         }
+        if (ith == 0 && getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
+            fprintf(stderr, "[mix-dbg0] entry M=%lld K=%lld N=%lld\n", (long long) gemm_m,
+                    (long long) gemm_k, (long long) gemm_n);
+        }
 
         const gemm_path_i8 & path = dense_ops_;
         if (!path.kernel) {
@@ -720,6 +724,12 @@ private:
                 std::min(gemm_n_stride, spacemit_kernels::div_round_up(max_gemm_n_stride, NB_COLS) * NB_COLS);
         }
 
+        if (ith == 0 && getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
+            fprintf(stderr, "[mix-dbg1] M=%lld path=%s\n", (long long) gemm_m,
+                    (gemm_n_stride == gemm_n && tcm_buffer != nullptr && per_mb_rows_wsize <= tcm_buffer_size)
+                        ? "1(mix-candidate)"
+                        : (tcm_buffer != nullptr && per_nb_cols_wsize <= tcm_buffer_size) ? "2" : "3");
+        }
         if (gemm_n_stride == gemm_n && tcm_buffer != nullptr && per_mb_rows_wsize <= tcm_buffer_size) {
             // SMEPilot-style mixed IME+RVV execution (K1 Q4_0 path only).
             // IME threads compute rows [0, m_split); RVV threads compute rows [m_split, gemm_m).
