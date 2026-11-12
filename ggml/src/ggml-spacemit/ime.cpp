@@ -740,9 +740,9 @@ private:
                     ggml::cpu::riscv64_spacemit::mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
                                               output, gemm_n, mb, me);
                 }
-                return;
-            }
-
+                // 不能 return: 所有线程必须到达函数末尾的 ctx.sync(),
+                // 提前退出会导致 barrier 计数不匹配, 破坏后续所有算子
+            } else {
             for (int64_t m_start = ith * row_align; m_start < m_split; m_start += row_align * n_ime) {
                 uint8_t * b_col    = reinterpret_cast<uint8_t *>(w_data);
                 uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
@@ -773,6 +773,7 @@ private:
                     }
                 }
             }
+            }  // else (IME workers when mix_active)
         } else if (tcm_buffer != nullptr && per_nb_cols_wsize <= tcm_buffer_size) {
             uint8_t * a_row = quant_a_buffer;
             uint8_t * b_col = reinterpret_cast<uint8_t *>(tcm_buffer);
