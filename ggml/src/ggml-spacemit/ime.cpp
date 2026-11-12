@@ -361,69 +361,87 @@ static inline float mix_fp16_to_fp32(uint16_t h) {
 static constexpr int64_t MIX_Q4_BLK_BYTES = 288;
 static constexpr int64_t MIX_Q4_BLK_QS    = 32;   // offset of qs inside block
 
-static inline float mix_q4_0x16_at(const uint8_t * blk, int r, int k) {
-    const uint8_t * qs   = blk + MIX_Q4_BLK_QS;
-    int             half = k >> 4;           // 0: k<16, 1: k>=16
-    int             kk   = k & 15;
-    uint8_t         b    = qs[half * 128 + r * 8 + (kk & 7)];
-    int             q    = (kk < 8) ? (b & 0x0F) : (b >> 4);
-    float           d    = mix_fp16_to_fp32(((const uint16_t *) blk)[r]);
-    return (q - 8) * d;
-}
-
 // Dequantize one 16-row strip (rows [n0, n0+rows) x all K) into fp32.
 // strip layout: row-major, row r at strip + r * gemm_k.
-static void mix_dequant_strip_q4_0x16(const uint8_t * w_data, int64_t row_stride_b, int64_t nb, int rows,
-                                      int64_t gemm_k, float * strip) {
-    const int64_t b_k_blks = row_stride_b / MIX_Q4_BLK_BYTES;
-    for (int r = 0; r < rows; r++) {
-        float * dst = strip + (int64_t) r * gemm_k;
-        for (int64_t kb = 0; kb < b_k_blks; kb++) {
-            const uint8_t * blk = w_data + nb * row_stride_b + kb * MIX_Q4_BLK_BYTES;
-            for (int k = 0; k < 32; k++) {
-                dst[kb * 32 + k] = mix_q4_0x16_at(blk, r, k);
-            }
-        }
+// v2: 全向量化反量化 + lane-resident GEMM (无归约、无 slide)
+//
+// 反量化: 把 288B 的 Q4_0x16 块 (16 行 × 32k) 直接展开成**转置** fp32 条带 wT[k][n]
+// (wT[(kb*32+k)*16 + r] = 权重(n0+r, kb*32+k))。
+//   - nibble 展开用向量指令: vand/vsrl →  widen i16 → sub 8 → vfwcvt fp32 → 乘 scale
+//   - 转置用 vsse32 (strided store, stride=64B) —— 不是 slide/reduction, X60 上便宜
+//
+// GEMM 部分与 TCM benchmark 同构: lane = 输出列 n (16 列 = 2×e32m1),
+// K 循环只有 vfmacc 广播乘加, 结果直接 vse32 存出, 全程零归约。
+
+// 展开半个块 (16 行 × 16k) 并转置写入 wT
+static inline void mix_dequant_half_T(const uint8_t * qs_half, const float * d, float * wT, int k0) {
+    // qs_half: 128B, 行 r 的 8 字节在 qs_half[r*8 .. r*8+7]
+    // 低 nibble → k0+0..7, 高 nibble → k0+8..15
+    for (int r = 0; r < 16; r++) {
+        vint8m1_t  v    = __riscv_vle8_v_i8m1((const int8_t *) (qs_half + r * 8), 8);
+        vuint8m1_t vu   = __riscv_vreinterpret_v_i8m1_u8m1(v);
+        vint8m1_t  lo8  = __riscv_vreinterpret_v_u8m1_i8m1(__riscv_vand_vx_u8m1(vu, 0x0F, 8));
+        vuint8m1_t hi8u = __riscv_vsrl_vx_u8m1(vu, 4, 8);
+        vint8m1_t  hi8  = __riscv_vreinterpret_v_u8m1_i8m1(hi8u);
+        // widen to i16, sub 8, widen to fp32, 乘 scale
+        vint16m2_t lo16 = __riscv_vsub_vx_i16m2(__riscv_vwcvt_x_x_v_i16m2(lo8, 8), 8, 8);
+        vint16m2_t hi16 = __riscv_vsub_vx_i16m2(__riscv_vwcvt_x_x_v_i16m2(hi8, 8), 8, 8);
+        vfloat32m4_t lof = __riscv_vfmul_vf_f32m4(__riscv_vfwcvt_f_x_v_f32m4(lo16, 8), d[r], 8);
+        vfloat32m4_t hif = __riscv_vfmul_vf_f32m4(__riscv_vfwcvt_f_x_v_f32m4(hi16, 8), d[r], 8);
+        // 转置存: 8 个连续 k 值 (固定列 r), 地址 stride = 16 floats = 64B
+        __riscv_vsse32_v_f32m4(wT + (size_t) (k0 + 0) * 16 + r, 64, lof, 8);
+        __riscv_vsse32_v_f32m4(wT + (size_t) (k0 + 8) * 16 + r, 64, hif, 8);
     }
 }
 
-// RVV fp32 GEMM over rows [m_begin, m_end) x all gemm_n columns.
-// A = feature (row-major fp32, lda = gemm_k); C = output + m*gemm_n.
+static void mix_dequant_strip_T(const uint8_t * w_data, int64_t row_stride_b, int64_t nb, int64_t gemm_k,
+                                float * wT) {
+    const int64_t b_k_blks = row_stride_b / MIX_Q4_BLK_BYTES;
+    for (int64_t kb = 0; kb < b_k_blks; kb++) {
+        const uint8_t *  blk = w_data + nb * row_stride_b + kb * MIX_Q4_BLK_BYTES;
+        float            d[16];
+        const uint16_t * dh = (const uint16_t *) blk;
+        for (int r = 0; r < 16; r++) d[r] = mix_fp16_to_fp32(dh[r]);
+        const uint8_t * qs = blk + MIX_Q4_BLK_QS;
+        mix_dequant_half_T(qs,       d, wT, (int) (kb * 32));      // k 0..15
+        mix_dequant_half_T(qs + 128, d, wT, (int) (kb * 32 + 16)); // k 16..31
+    }
+}
+
+// RVV fp32 GEMM v2: lane-resident, 无归约无 slide
 static void mix_rvv_gemm_rows_q4_0x16(const float * feature, int64_t gemm_k, const uint8_t * w_data,
                                       int64_t row_stride_b, float * output, int64_t gemm_n, int64_t m_begin,
                                       int64_t m_end) {
-    // per-thread dequant strip buffer (16 x gemm_k floats), heap-allocated once
-    static thread_local std::vector<float> strip_buf;
-    if ((int64_t) strip_buf.size() < 16 * gemm_k) {
-        strip_buf.resize(16 * gemm_k);
+    // wT 条带: [gemm_k][16] fp32, 线程级缓存, 每列块反量化一次、全部 m 行复用
+    static thread_local std::vector<float> wt_buf;
+    if ((int64_t) wt_buf.size() < gemm_k * 16) {
+        wt_buf.resize(gemm_k * 16);
     }
-    float * strip = strip_buf.data();
+    float * wT = wt_buf.data();
+
+    const size_t vl = __riscv_vsetvlmax_e32m1();  // 8
 
     for (int64_t nb = 0; nb * 16 < gemm_n; nb++) {
-        const int rows = (int) std::min<int64_t>(16, gemm_n - nb * 16);
-        mix_dequant_strip_q4_0x16(w_data, row_stride_b, nb, rows, gemm_k, strip);
+        mix_dequant_strip_T(w_data, row_stride_b, nb, gemm_k, wT);
 
         for (int64_t m = m_begin; m < m_end; m++) {
             const float * a = feature + m * gemm_k;
-            float *       c = output + m * gemm_n + nb * 16;
-            for (int r = 0; r < rows; r++) {
-                const float * b = strip + (int64_t) r * gemm_k;
-                // RVV fp32 dot product over gemm_k
-                vfloat32m1_t vsum = __riscv_vfmv_v_f_f32m1(0.0f, 1);
-                int64_t      k    = 0;
-                while (k < gemm_k) {
-                    size_t        vl  = __riscv_vsetvl_e32m4(gemm_k - k);
-                    vfloat32m4_t va   = __riscv_vle32_v_f32m4(a + k, vl);
-                    vfloat32m4_t vb   = __riscv_vle32_v_f32m4(b + k, vl);
-                    vfloat32m4_t prod = __riscv_vfmul_vv_f32m4(va, vb, vl);
-                    vsum              = __riscv_vfredusum_vs_f32m4_f32m1(prod, vsum, vl);
-                    k += vl;
-                }
-                c[r] = __riscv_vfmv_f_s_f32m1_f32(vsum);
+            vfloat32m1_t  acc0 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            vfloat32m1_t  acc1 = __riscv_vfmv_v_f_f32m1(0.0f, vl);
+            const float * bp   = wT;
+            for (int64_t k = 0; k < gemm_k; k++) {
+                vfloat32m1_t b0 = __riscv_vle32_v_f32m1(bp, vl);
+                vfloat32m1_t b1 = __riscv_vle32_v_f32m1(bp + vl, vl);
+                bp += 16;
+                acc0 = __riscv_vfmacc_vf_f32m1(acc0, a[k], b0, vl);
+                acc1 = __riscv_vfmacc_vf_f32m1(acc1, a[k], b1, vl);
             }
+            float * c = output + m * gemm_n + nb * 16;
+            __riscv_vse32_v_f32m1(c, acc0, vl);
+            __riscv_vse32_v_f32m1(c + vl, acc1, vl);
         }
     }
-}
+}}
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
     const gemm_path_i8 dense_ops_;
