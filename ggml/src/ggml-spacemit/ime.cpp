@@ -320,8 +320,8 @@ static const mix_exec_config & mix_config() {
 
 static int mix_ime_workers(int nth) {
     int n_ime = mix_config().ime_workers > 0 ? mix_config().ime_workers : nth / 2;
-    if (n_ime < 1)      n_ime = 1;
-    if (n_ime > nth - 1) n_ime = nth - 1;   // keep >=1 RVV worker
+    if (n_ime < 1)   n_ime = 1;
+    if (n_ime > nth) n_ime = nth;   // n_ime == nth means RVV does nothing (bisect knob)
     return n_ime;
 }
 
