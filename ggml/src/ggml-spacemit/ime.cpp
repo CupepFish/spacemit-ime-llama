@@ -749,8 +749,31 @@ private:
                 const int64_t mb     = m_split + (int64_t) (ith - n_ime) * per;
                 const int64_t me     = std::min(mb + per, gemm_m);
                 if (mb < me) {
+                    if (getenv("GGML_SPACEMIT_MIX_SCALAR") != nullptr) {
+                        // 判决实验: 纯标量 RVV 行计算 (无向量/无 wT), 验证集成逻辑
+                        const uint8_t * wbase = reinterpret_cast<const uint8_t *>(w_data);
+                        for (int64_t m = mb; m < me; m++) {
+                            for (int64_t n = 0; n < gemm_n; n++) {
+                                double ref = 0;
+                                const uint8_t * nbbase = wbase + (n / 16) * row_stride_b;
+                                int rr = (int) (n % 16);
+                                for (int64_t kb = 0; kb * MIX_Q4_BLK_BYTES < row_stride_b; kb++) {
+                                    const uint8_t * blk = nbbase + kb * MIX_Q4_BLK_BYTES;
+                                    float d = ggml::cpu::riscv64_spacemit::mix_fp16_to_fp32(((const uint16_t *) blk)[rr]);
+                                    for (int k = 0; k < 32; k++) {
+                                        int half = k >> 4, jj = k & 15;
+                                        uint8_t byte = blk[MIX_Q4_BLK_QS + half * 128 + rr * 8 + (jj & 7)];
+                                        int q = (jj < 8) ? (byte & 0x0F) : (byte >> 4);
+                                        ref += feature[m * gemm_k + kb * 32 + k] * (q - 8) * d;
+                                    }
+                                }
+                                output[m * gemm_n + n] = (float) ref;
+                            }
+                        }
+                    } else {
                     ggml::cpu::riscv64_spacemit::mix_rvv_gemm_rows_q4_0x16(feature, gemm_k, reinterpret_cast<uint8_t *>(w_data), row_stride_b,
                                               output, gemm_n, mb, me);
+                    }
                     if (getenv("GGML_SPACEMIT_MIX_DEBUG") != nullptr) {
                         // 全量自检: 该线程 RVV 范围内随机抽样 (行×列), 标量参考对比
                         // 报告 max abs err / 位置 / NaN 统计
