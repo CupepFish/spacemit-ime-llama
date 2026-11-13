@@ -412,11 +412,9 @@ static void mix_dequant_strip_T(const uint8_t * w_data, int64_t row_stride_b, in
 static void mix_rvv_gemm_rows_q4_0x16(const float * feature, int64_t gemm_k, const uint8_t * w_data,
                                       int64_t row_stride_b, float * output, int64_t gemm_n, int64_t m_begin,
                                       int64_t m_end) {
-    // wT 条带: [gemm_k][16] fp32, 线程级缓存, 每列块反量化一次、全部 m 行复用
-    static thread_local std::vector<float> wt_buf;
-    if ((int64_t) wt_buf.size() < gemm_k * 16) {
-        wt_buf.resize(gemm_k * 16);
-    }
+    // wT 条带: [gemm_k][16] fp32
+    // DEBUG: 每次调用现分配, 排除 spert worker 线程 thread_local 语义异常的可能
+    std::vector<float> wt_buf((size_t) gemm_k * 16);
     float * wT = wt_buf.data();
 
     const size_t vl = __riscv_vsetvlmax_e32m1();  // 8
